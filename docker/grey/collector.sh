@@ -68,12 +68,9 @@ collect_containers_json() {
 }
 
 collect_payload() {
-  local collected_at containers_json container_count
+  local collected_at containers_json
   collected_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
   containers_json=$(collect_containers_json)
-  container_count=$(printf '%s' "$containers_json" | grep -o '"name"' | wc -l | tr -d ' ')
-
-  log "[$SERVER_ENV] 采集 $container_count 个容器"
 
   cat <<EOF
 {"env":"$(json_escape "$SERVER_ENV")","containers":$containers_json,"collected_at":"$collected_at"}
@@ -81,8 +78,10 @@ EOF
 }
 
 push_once() {
-  local payload http_code body
+  local payload http_code body container_count
   payload=$(collect_payload)
+  container_count=$(printf '%s' "$payload" | grep -o '"name"' | wc -l | tr -d ' ')
+  log "[$SERVER_ENV] 采集 $container_count 个容器"
 
   if (( DRY_RUN )); then
     echo "$payload"
