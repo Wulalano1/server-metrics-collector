@@ -1,0 +1,14 @@
+[Unit]
+Description=Ops server metrics collector (staging)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/server-metrics-collector
+ExecStart=/opt/server-metrics-collector/collector.sh --loop
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
