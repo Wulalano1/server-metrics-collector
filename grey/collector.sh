@@ -148,7 +148,10 @@ push_once() {
     --max-time "$((CURL_TIMEOUT * 2))" \
     -d "$payload") || die "curl 失败"
 
-  [[ "$http_code" =~ ^2 ]] || die "推送失败 HTTP $http_code: $(head -c 300 "$body")"
+  [[ "$http_code" =~ ^2 ]] || {
+    log "ERROR: 推送失败 HTTP $http_code: $(head -c 300 "$body")"
+    return 1
+  }
   log "[$SERVER_ENV] 推送成功 HTTP $http_code ($(echo "$payload" | tr -d '\n' | head -c 120)…)"
 }
 

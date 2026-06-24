@@ -1,17 +1,23 @@
 # server-metrics-collector
 
-运维平台服务器指标采集（CPU / 内存 / 磁盘），推送到 `ops-api.dev.iannil.net`。
+运维平台宿主机采集脚本，推送到 `ops-api.dev.iannil.net`。
 
 **开箱即用**：`collector.env` 已预填 Token 与环境，部署无需改配置。
 
 ## 仓库结构
 
 ```
-staging/    → 拷到 staging 服务器，sudo ./install.sh
-grey/       → 拷到 grey 服务器，sudo ./install.sh
+staging/          → 服务器指标（CPU / 内存 / 磁盘）
+grey/             → 服务器指标
+docker/staging/   → Docker 容器状态
+docker/grey/      → Docker 容器状态
 ```
 
-## 部署（staging 示例）
+---
+
+## 一、服务器指标
+
+### 部署（staging）
 
 ```bash
 git clone https://github.com/Wulalano1/server-metrics-collector.git /opt/server-metrics-collector-repo
@@ -20,7 +26,7 @@ chmod +x install.sh collector.sh
 sudo ./install.sh
 ```
 
-## 部署（grey）
+### 部署（grey）
 
 ```bash
 git clone https://github.com/Wulalano1/server-metrics-collector.git /opt/server-metrics-collector-repo
@@ -29,19 +35,63 @@ chmod +x install.sh collector.sh
 sudo ./install.sh
 ```
 
-## 验证
+### 验证
 
 ```bash
 /opt/server-metrics-collector/collector.sh
 sudo journalctl -u server-metrics-collector -f
 ```
 
-## ops 后台
+---
 
-staging 上 ops 容器 `.env` 需有：
+## 二、Docker 状态监控
 
-```env
-METRICS_PUSH_TOKEN=ops-metrics-push-iannil-2026
+与服务器指标相同流程：clone 同一仓库，进入 `docker/<环境>` 目录安装。
+
+### 部署（staging）
+
+```bash
+git clone https://github.com/Wulalano1/server-metrics-collector.git /opt/server-metrics-collector-repo
+cd /opt/server-metrics-collector-repo/docker/staging
+chmod +x install.sh collector.sh
+sudo ./install.sh
 ```
 
-与 `collector.env` 一致。
+### 部署（grey）
+
+```bash
+git clone https://github.com/Wulalano1/server-metrics-collector.git /opt/server-metrics-collector-repo
+cd /opt/server-metrics-collector-repo/docker/grey
+chmod +x install.sh collector.sh
+sudo ./install.sh
+```
+
+### 验证
+
+```bash
+/opt/docker-status-collector/collector.sh --dry-run
+/opt/docker-status-collector/collector.sh
+sudo journalctl -u docker-status-collector -f
+```
+
+---
+
+## ops 后台配置
+
+ops-api 容器 `.env` 需有：
+
+```env
+OPS_DB_HOST=...
+OPS_DB_DATABASE=ops_platform
+METRICS_PUSH_TOKEN=ops-metrics-push-iannil-2026
+DOCKER_MONITOR_ENABLED=true
+```
+
+与各目录 `collector.env` 中 `METRICS_PUSH_TOKEN` 一致。
+
+推送接口：
+
+| 类型 | 路径 |
+|------|------|
+| 服务器指标 | `POST /api/v1/server/metrics/report` |
+| Docker 状态 | `POST /api/v1/docker/report` |

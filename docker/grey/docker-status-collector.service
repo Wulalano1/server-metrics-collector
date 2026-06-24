@@ -1,0 +1,14 @@
+[Unit]
+Description=Ops Docker status collector (grey)
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/docker-status-collector
+ExecStart=/opt/docker-status-collector/collector.sh --loop
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
