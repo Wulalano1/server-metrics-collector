@@ -1,0 +1,14 @@
+[Unit]
+Description=Ops service health probe (production)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/service-health-probe
+ExecStart=/opt/service-health-probe/collector.sh --loop
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

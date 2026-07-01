@@ -7,10 +7,13 @@
 ## 仓库结构
 
 ```
-staging/          → 服务器指标（CPU / 内存 / 磁盘）
-grey/             → 服务器指标
-docker/staging/   → Docker 容器状态
-docker/grey/      → Docker 容器状态
+staging/                  → 服务器指标（CPU / 内存 / 磁盘）
+grey/                     → 服务器指标
+docker/staging/           → Docker 容器状态
+docker/grey/              → Docker 容器状态
+service-health/staging/   → 服务端口探针（MySQL 3306 / HTTP 80 / HTTPS 443）
+service-health/grey/      → 服务端口探针
+service-health/production/→ 服务端口探针
 ```
 
 ---
@@ -95,3 +98,49 @@ DOCKER_MONITOR_ENABLED=true
 |------|------|
 | 服务器指标 | `POST /api/v1/server/metrics/report` |
 | Docker 状态 | `POST /api/v1/docker/report` |
+| 服务端口探针 | `POST /api/v1/service-health/report` |
+
+---
+
+## 三、服务端口探针
+
+与服务器指标、Docker 相同流程：clone 同一仓库，进入 `service-health/<环境>` 目录安装。
+
+默认探针：MySQL `3306`（TCP）、HTTP `80`、HTTPS `443`。
+
+### 部署（staging）
+
+```bash
+git clone https://github.com/Wulalano1/server-metrics-collector.git /opt/server-metrics-collector-repo
+cd /opt/server-metrics-collector-repo/service-health/staging
+chmod +x install.sh collector.sh
+sudo ./install.sh
+```
+
+### 部署（grey）
+
+```bash
+git clone https://github.com/Wulalano1/server-metrics-collector.git /opt/server-metrics-collector-repo
+cd /opt/server-metrics-collector-repo/service-health/grey
+chmod +x install.sh collector.sh
+sudo ./install.sh
+```
+
+### 部署（production）
+
+```bash
+git clone https://github.com/Wulalano1/server-metrics-collector.git /opt/server-metrics-collector-repo
+cd /opt/server-metrics-collector-repo/service-health/production
+chmod +x install.sh collector.sh
+sudo ./install.sh
+```
+
+### 验证
+
+```bash
+/opt/service-health-probe/collector.sh --dry-run
+/opt/service-health-probe/collector.sh
+sudo journalctl -u service-health-probe -f
+```
+
+如需增删探针，编辑 `/opt/service-health-probe/collector.env` 中的 `PROBE_TARGETS`（JSON 数组）。
