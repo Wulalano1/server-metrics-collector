@@ -106,46 +106,33 @@ probe_http() {
 
 parse_target_field() {
   local json=$1 field=$2
-  printf '%s' "$json" | python3 -c "
-import json, sys
-obj = json.load(sys.stdin)
-v = obj.get(sys.argv[1])
-print('' if v is None else v)
-" "$field" 2>/dev/null || true
+  local match
+  match=$(printf '%s' "$json" | grep -oE "\"${field}\"[[:space:]]*:[[:space:]]*\"([^\"]*)\"" | head -1)
+  [[ -z "$match" ]] && return 0
+  printf '%s' "$match" | sed -E 's/^"[^"]+"[[:space:]]*:[[:space:]]*"([^"]*)"$/\1/'
 }
 
 parse_target_number() {
   local json=$1 field=$2
-  printf '%s' "$json" | python3 -c "
-import json, sys
-obj = json.load(sys.stdin)
-v = obj.get(sys.argv[1])
-print('' if v is None else int(v))
-" "$field" 2>/dev/null || true
+  local match
+  match=$(printf '%s' "$json" | grep -oE "\"${field}\"[[:space:]]*:[[:space:]]*[0-9]+" | head -1)
+  [[ -z "$match" ]] && return 0
+  printf '%s' "$match" | sed -E 's/^"[^"]+"[[:space:]]*:[[:space:]]*//'
 }
 
 split_targets() {
   local raw=${PROBE_TARGETS:-$DEFAULT_PROBE_TARGETS}
-  export PROBE_TARGETS_JSON="$raw"
-  python3 <<'PY'
-import json, os, sys
+  raw=$(printf '%s' "$raw" | tr -d '\n\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+  raw=${raw#\[}
+  raw=${raw%\]}
 
-raw = os.environ.get("PROBE_TARGETS_JSON", "").strip()
-if not raw:
-    sys.exit(0)
-try:
-    data = json.loads(raw)
-except json.JSONDecodeError as e:
-    print(f"invalid PROBE_TARGETS json: {e}", file=sys.stderr)
-    sys.exit(1)
-if isinstance(data, dict):
-    data = [data]
-if not isinstance(data, list):
-    sys.exit(1)
-for item in data:
-    if isinstance(item, dict):
-        print(json.dumps(item, ensure_ascii=False, separators=(",", ":")))
-PY
+  printf '%s' "$raw" | sed 's/[[:space:]]*}[[:space:]]*,[[:space:]]*{[[:space:]]*/}\n{/g' | while IFS= read -r line; do
+    line=$(printf '%s' "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    [[ -z "$line" ]] && continue
+    [[ "$line" != \{* ]] && line="{${line}"
+    [[ "$line" != *\} ]] && line="${line}}"
+    printf '%s\n' "$line"
+  done
 }
 
 build_services_json() {
@@ -216,7 +203,7 @@ push_once() {
   log "[$SERVER_ENV] 探针 $target_count 个目标"
 
   if (( DRY_RUN )); then
-    echo "$payload" | python3 -m json.tool 2>/dev/null || echo "$payload"
+    echo "$payload"
     return 0
   fi
 
