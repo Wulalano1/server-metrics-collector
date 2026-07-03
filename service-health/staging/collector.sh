@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # 独立服务端口健康探针（与 ops 完全解耦，自行 cron / systemd 运行）
-# TCP（如 MySQL 3306）、HTTP/HTTPS（如 80/443），HTTP 推送到 ops 后台
+# 默认自动采集本机所有 TCP 监听端口（ss -tlnH）；可选 PROBE_TARGETS 手动覆盖、PROBE_EXCLUDE_PORTS 排除端口
 # 用法:
 #   ./collector.sh              # 单次推送（适合 cron）
 #   ./collector.sh --loop       # 持续探针（适合 systemd）
@@ -31,12 +31,6 @@ source "$ENV_FILE"
 PROBE_TIMEOUT="${PROBE_TIMEOUT:-3}"
 CURL_TIMEOUT="${CURL_TIMEOUT:-5}"
 INTERVAL_SECONDS="${INTERVAL_SECONDS:-30}"
-
-DEFAULT_PROBE_TARGETS='[
-  {"service_id":"mysql","name":"MySQL","probe_type":"tcp","host":"127.0.0.1","port":3306},
-  {"service_id":"http-80","name":"HTTP 80","probe_type":"http","host":"127.0.0.1","port":80},
-  {"service_id":"https-443","name":"HTTPS 443","probe_type":"https","host":"127.0.0.1","port":443}
-]'
 
 json_escape() {
   local s=$1
@@ -77,7 +71,8 @@ probe_http() {
   local start end elapsed http_code body err
   start=$(now_ms)
   body=$(mktemp)
-  trap 'rm -f "$body"' RETURN
+  cleanup() { rm -f "$body"; }
+  trap cleanup RETURN
 
   local curl_opts=(-sS -o "$body" -w "%{http_code}" --connect-timeout "$PROBE_TIMEOUT" --max-time "$CURL_TIMEOUT")
   if [[ "$scheme" == "https" ]]; then
@@ -120,19 +115,99 @@ parse_target_number() {
   printf '%s' "$match" | sed -E 's/^"[^"]+"[[:space:]]*:[[:space:]]*//'
 }
 
-split_targets() {
-  local raw=${PROBE_TARGETS:-$DEFAULT_PROBE_TARGETS}
+port_excluded() {
+  local port=$1 exclude="${PROBE_EXCLUDE_PORTS:-}"
+  [[ -z "$exclude" ]] && return 1
+  [[ ",${exclude}," == *",${port},"* ]]
+}
+
+infer_probe_type() {
+  case "$1" in
+    80) echo http ;;
+    443|8443) echo https ;;
+    *) echo tcp ;;
+  esac
+}
+
+list_listening_endpoints() {
+  command -v ss >/dev/null 2>&1 || die "需要 ss 命令（iproute2）"
+  ss -tlnH 2>/dev/null | awk '
+    {
+      local_addr = $4
+      n = split(local_addr, p, ":")
+      port = p[n]
+      if (port !~ /^[0-9]+$/) next
+      addr = p[1]
+      for (i = 2; i < n; i++) addr = addr ":" p[i]
+      gsub(/[\[\]]/, "", addr)
+      if (addr == "" || addr == "*" || addr == "0.0.0.0" || addr == "::") addr = "127.0.0.1"
+      print addr "\t" port
+    }
+  '
+}
+
+list_discovered_targets() {
+  declare -A seen_port preferred_host
+  local host port probe_type sorted_ports
+
+  while IFS=$'\t' read -r host port; do
+    [[ -z "$port" ]] && continue
+    port_excluded "$port" && continue
+
+    if [[ -n "${seen_port[$port]:-}" ]]; then
+      [[ "$host" == "127.0.0.1" ]] && preferred_host[$port]="$host"
+      continue
+    fi
+
+    seen_port[$port]=1
+    preferred_host[$port]="$host"
+  done < <(list_listening_endpoints)
+
+  sorted_ports=$(
+    for port in "${!seen_port[@]}"; do
+      printf '%s\n' "$port"
+    done | sort -n
+  )
+
+  while IFS= read -r port; do
+    [[ -z "$port" ]] && continue
+    host=${preferred_host[$port]}
+    probe_type=$(infer_probe_type "$port")
+    printf '{"service_id":"port-%s","name":"Port %s","probe_type":"%s","host":"%s","port":%s}\n' \
+      "$port" "$port" "$probe_type" "$host" "$port"
+  done <<< "$sorted_ports"
+}
+
+split_manual_targets() {
+  local raw=${PROBE_TARGETS:?}
   raw=$(printf '%s' "$raw" | tr -d '\n\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
   raw=${raw#\[}
   raw=${raw%\]}
 
-  printf '%s' "$raw" | sed 's/[[:space:]]*}[[:space:]]*,[[:space:]]*{[[:space:]]*/}\n{/g' | while IFS= read -r line; do
-    line=$(printf '%s' "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-    [[ -z "$line" ]] && continue
-    [[ "$line" != \{* ]] && line="{${line}"
-    [[ "$line" != *\} ]] && line="${line}}"
-    printf '%s\n' "$line"
+  local rest="$raw" chunk
+  while [[ -n "$rest" ]]; do
+    rest="${rest#"${rest%%[![:space:]]*}"}"
+    if [[ "$rest" == *'},'* ]]; then
+      chunk="${rest%%\},*}"
+      rest="${rest#*\},}"
+    else
+      chunk="$rest"
+      rest=""
+    fi
+    chunk=$(printf '%s' "$chunk" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    [[ -z "$chunk" ]] && continue
+    [[ "$chunk" != \{* ]] && chunk="{${chunk}"
+    [[ "$chunk" != *\} ]] && chunk="${chunk}}"
+    printf '%s\n' "$chunk"
   done
+}
+
+list_probe_target_items() {
+  if [[ -n "${PROBE_TARGETS:-}" ]]; then
+    split_manual_targets
+  else
+    list_discovered_targets
+  fi
 }
 
 build_services_json() {
@@ -185,10 +260,13 @@ EOF
     else
       services_json="$entry"
     fi
-  done < <(split_targets)
+  done < <(list_probe_target_items)
 
   if (( count == 0 )); then
-    die "未配置有效探针目标（检查 PROBE_TARGETS）"
+    if [[ -n "${PROBE_TARGETS:-}" ]]; then
+      die "未配置有效探针目标（检查 PROBE_TARGETS）"
+    fi
+    die "未发现可探针的 TCP 监听端口（检查 ss -tlnH 或 PROBE_EXCLUDE_PORTS）"
   fi
 
   cat <<EOF

@@ -11,7 +11,7 @@ staging/                  → 服务器指标（CPU / 内存 / 磁盘）
 grey/                     → 服务器指标
 docker/staging/           → Docker 容器状态
 docker/grey/              → Docker 容器状态
-service-health/staging/   → 服务端口探针（MySQL 3306 / HTTP 80 / HTTPS 443）
+service-health/staging/   → 服务端口探针（自动采集本机 TCP 监听端口）
 service-health/grey/      → 服务端口探针
 service-health/production/→ 服务端口探针
 ```
@@ -106,7 +106,7 @@ DOCKER_MONITOR_ENABLED=true
 
 与服务器指标、Docker 相同流程：clone 同一仓库，进入 `service-health/<环境>` 目录安装。
 
-默认探针：MySQL `3306`（TCP）、HTTP `80`、HTTPS `443`。
+脚本通过 `ss -tlnH` **自动发现本机所有 TCP 监听端口**并探针，无需手动配置端口列表。可选 `PROBE_EXCLUDE_PORTS` 排除端口，或 `PROBE_TARGETS` 完全手动指定。
 
 ### 部署（staging）
 
@@ -143,4 +143,4 @@ sudo ./install.sh
 sudo journalctl -u service-health-probe -f
 ```
 
-如需增删探针，编辑 `/opt/service-health-probe/collector.env` 中的 `PROBE_TARGETS`（JSON 数组）。
+可选：编辑 `/opt/service-health-probe/collector.env` 设置 `PROBE_EXCLUDE_PORTS` 或 `PROBE_TARGETS`，改完重启 `service-health-probe` 服务。
