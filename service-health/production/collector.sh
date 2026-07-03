@@ -106,18 +106,46 @@ probe_http() {
 
 parse_target_field() {
   local json=$1 field=$2
-  echo "$json" | sed -n "s/.*\"${field}\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" | head -1
+  printf '%s' "$json" | python3 -c "
+import json, sys
+obj = json.load(sys.stdin)
+v = obj.get(sys.argv[1])
+print('' if v is None else v)
+" "$field" 2>/dev/null || true
 }
 
 parse_target_number() {
   local json=$1 field=$2
-  echo "$json" | sed -n "s/.*\"${field}\"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p" | head -1
+  printf '%s' "$json" | python3 -c "
+import json, sys
+obj = json.load(sys.stdin)
+v = obj.get(sys.argv[1])
+print('' if v is None else int(v))
+" "$field" 2>/dev/null || true
 }
 
 split_targets() {
   local raw=${PROBE_TARGETS:-$DEFAULT_PROBE_TARGETS}
-  raw=$(echo "$raw" | tr -d '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-  echo "$raw" | sed 's/},{/}\n{/g' | sed 's/^\[//;s/\]$//' | sed 's/^[[:space:]]*{/{/'
+  export PROBE_TARGETS_JSON="$raw"
+  python3 <<'PY'
+import json, os, sys
+
+raw = os.environ.get("PROBE_TARGETS_JSON", "").strip()
+if not raw:
+    sys.exit(0)
+try:
+    data = json.loads(raw)
+except json.JSONDecodeError as e:
+    print(f"invalid PROBE_TARGETS json: {e}", file=sys.stderr)
+    sys.exit(1)
+if isinstance(data, dict):
+    data = [data]
+if not isinstance(data, list):
+    sys.exit(1)
+for item in data:
+    if isinstance(item, dict):
+        print(json.dumps(item, ensure_ascii=False, separators=(",", ":")))
+PY
 }
 
 build_services_json() {
@@ -126,8 +154,7 @@ build_services_json() {
 
   while IFS= read -r item; do
     [[ -z "$item" ]] && continue
-    [[ "$item" != \{* ]] && item="{${item}"
-    [[ "$item" != *\} ]] && item="${item}}"
+    item=$(printf '%s' "$item" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
 
     local service_id name probe_type host port status http_status response_ms error_msg
     service_id=$(parse_target_field "$item" service_id)
@@ -211,7 +238,7 @@ main() {
   [[ "$(uname -s)" == "Linux" ]] || die "仅支持 Linux"
 
   if (( LOOP )); then
-    log "持续探针模式，间隔 ${INTERVAL_SECONDS}s，目标 $OPS_PUSH_URL"
+    log "持续探针模式，间隔 ${INTERVAL_SECONDS}s，推送 $OPS_PUSH_URL"
     while true; do
       push_once || log "WARN: 本次探针失败，${INTERVAL_SECONDS}s 后重试"
       sleep "$INTERVAL_SECONDS"
