@@ -93,6 +93,34 @@ read_disk_percent() {
   echo "null"
 }
 
+# 采集所有本地磁盘挂载点（排除 tmpfs / overlay 等），输出 JSON 数组与最高使用率
+read_disks_payload() {
+  df -P 2>/dev/null | awk '
+    NR > 1 {
+      if ($1 ~ /^(tmpfs|devtmpfs|overlay|shm|squashfs|efivarfs|binfmt_misc|autofs)$/) next
+      gsub(/%/, "", $5)
+      usage = $5 + 0
+      if (max == "" || usage > max) max = usage
+      mount = $6
+      for (i = 7; i <= NF; i++) mount = mount " " $i
+      gsub(/\\/, "\\\\", mount)
+      gsub(/"/, "\\\"", mount)
+      gsub(/\\/, "\\\\", $1)
+      gsub(/"/, "\\\"", $1)
+      if (json != "") json = json ","
+      json = json sprintf("{\"mount\":\"%s\",\"filesystem\":\"%s\",\"usage\":%.1f}", mount, $1, usage)
+    }
+    END {
+      if (json == "") {
+        print "null"
+        print "null"
+      } else {
+        printf "[%s]\n", json
+        printf "%.1f\n", max + 0
+      }
+    }'
+}
+
 host_info() {
   local hostname ip
   hostname=$(hostname 2>/dev/null || echo "unknown")
@@ -105,11 +133,19 @@ host_info() {
 }
 
 collect_payload() {
-  local hostname ip cpu memory disk collected_at
+  local hostname ip cpu memory disk disks collected_at disks_json disk_max
   IFS=$'\t' read -r hostname ip <<< "$(host_info)"
   cpu=$(read_cpu_percent)
   memory=$(read_memory_percent)
-  disk=$(read_disk_percent)
+  mapfile -t _disk_lines < <(read_disks_payload)
+  disks_json="${_disk_lines[0]:-null}"
+  disk_max="${_disk_lines[1]:-}"
+  if [[ -n "$disk_max" && "$disk_max" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+    disk="$disk_max"
+  else
+    disk=$(read_disk_percent)
+  fi
+  disks="$disks_json"
   collected_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
   cat <<EOF
@@ -122,6 +158,7 @@ collect_payload() {
     "cpu": $cpu,
     "memory": $memory,
     "disk": $disk,
+    "disks": $disks,
     "collected_at": "$collected_at",
     "source": "linux"
   }
