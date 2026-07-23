@@ -267,13 +267,14 @@ ops_probe_targets_url() {
 }
 
 try_fetch_ops_probe_targets() {
-  local url body http_code item count=0
+  local url http_code item count=0 body_file
   url="$(ops_probe_targets_url)" || return 1
   url="${url}?env=${SERVER_ENV}"
 
-  body=$(mktemp)
-  trap 'rm -f "$body"' RETURN
-  http_code=$(curl -sS -o "$body" -w "%{http_code}" \
+  body_file=$(mktemp)
+  # shellcheck disable=SC2064
+  trap "rm -f '${body_file}'" RETURN
+  http_code=$(curl -sS -o "$body_file" -w "%{http_code}" \
     -H "Authorization: Bearer $METRICS_PUSH_TOKEN" \
     --connect-timeout "$CURL_TIMEOUT" \
     --max-time "$((CURL_TIMEOUT * 2))" \
@@ -288,7 +289,7 @@ try_fetch_ops_probe_targets() {
     [[ "$item" != *\} ]] && item="${item}}"
     printf '%s\n' "$item"
     count=$((count + 1))
-  done < <(grep -oE '\{"service_id"[^{}]*\}' "$body" 2>/dev/null || true)
+  done < <(grep -oE '\{"service_id"[^{}]*\}' "$body_file" 2>/dev/null || true)
 
   (( count > 0 ))
 }
@@ -432,9 +433,11 @@ push_once() {
     return 0
   fi
 
-  body=$(mktemp)
-  trap 'rm -f "$body"' RETURN
-  http_code=$(curl -sS -o "$body" -w "%{http_code}" \
+  local body_file
+  body_file=$(mktemp)
+  # shellcheck disable=SC2064
+  trap "rm -f '${body_file}'" RETURN
+  http_code=$(curl -sS -o "$body_file" -w "%{http_code}" \
     -X POST "$OPS_PUSH_URL" \
     -H "Content-Type: application/json" \
     -H "Authorization: Bearer $METRICS_PUSH_TOKEN" \
@@ -442,7 +445,7 @@ push_once() {
     --max-time "$((CURL_TIMEOUT * 2))" \
     -d "$payload") || die "curl 失败"
 
-  [[ "$http_code" =~ ^2 ]] || die "推送失败 HTTP $http_code: $(head -c 300 "$body")"
+  [[ "$http_code" =~ ^2 ]] || die "推送失败 HTTP $http_code: $(head -c 300 "$body_file")"
   log "[$SERVER_ENV] 推送成功 HTTP $http_code"
 }
 
