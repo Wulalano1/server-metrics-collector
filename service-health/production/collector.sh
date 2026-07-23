@@ -68,20 +68,26 @@ probe_tcp() {
 probe_http() {
   local scheme=$1 host=$2 port=$3
   local url="${scheme}://${host}:${port}/"
-  local start end elapsed http_code body err
+  local start end elapsed http_code body errfile err
   start=$(now_ms)
   body=$(mktemp)
-  trap 'rm -f "$body"' RETURN
+  errfile=$(mktemp)
+  cleanup() { rm -f "$body" "$errfile"; }
+  trap cleanup RETURN
 
   local curl_opts=(-sS -o "$body" -w "%{http_code}" --connect-timeout "$PROBE_TIMEOUT" --max-time "$CURL_TIMEOUT")
   if [[ "$scheme" == "https" ]]; then
     curl_opts+=(-k)
   fi
 
-  if ! http_code=$(curl "${curl_opts[@]}" "$url" 2>/dev/null); then
+  # 注意：对 127.0.0.1 做 HTTPS 时无域名 SNI，易被 Nginx ssl_reject_handshake 拒绝；
+  # 自动发现场景请用 tcp。手动 PROBE_TARGETS 可指定真实域名做 https。
+  if ! http_code=$(curl "${curl_opts[@]}" "$url" 2>"$errfile"); then
     end=$(now_ms)
     elapsed=$((end - start))
-    err=$(head -c 200 "$body" 2>/dev/null || echo "curl failed")
+    err=$(head -c 200 "$errfile" 2>/dev/null | tr '\n' ' ')
+    [[ -z "$err" ]] && err=$(head -c 200 "$body" 2>/dev/null | tr '\n' ' ')
+    [[ -z "$err" ]] && err="curl failed"
     echo "down|null|${elapsed}|$(json_escape "$err")"
     return 0
   fi
@@ -121,9 +127,9 @@ port_excluded() {
 }
 
 infer_probe_type() {
+  # 自动发现的监听地址多为 127.0.0.1：80 可用 HTTP；443/8443 若用 HTTPS 无 SNI 易误报，默认只做 TCP 探活
   case "$1" in
     80) echo http ;;
-    443|8443) echo https ;;
     *) echo tcp ;;
   esac
 }
@@ -192,9 +198,52 @@ split_manual_targets() {
   done
 }
 
+ops_probe_targets_url() {
+  if [[ -n "${OPS_PROBE_TARGETS_URL:-}" ]]; then
+    printf '%s' "$OPS_PROBE_TARGETS_URL"
+    return 0
+  fi
+  if [[ -n "${OPS_PUSH_URL:-}" ]]; then
+    printf '%s' "${OPS_PUSH_URL%/report}/probe-targets"
+    return 0
+  fi
+  return 1
+}
+
+fetch_ops_probe_targets() {
+  local url body http_code item count=0
+  url="$(ops_probe_targets_url)" || die "无法解析 OPS 探针配置 URL（设置 OPS_PROBE_TARGETS_URL 或 OPS_PUSH_URL）"
+  url="${url}?env=${SERVER_ENV}"
+
+  body=$(mktemp)
+  trap 'rm -f "$body"' RETURN
+  http_code=$(curl -sS -o "$body" -w "%{http_code}" \
+    -H "Authorization: Bearer $METRICS_PUSH_TOKEN" \
+    --connect-timeout "$CURL_TIMEOUT" \
+    --max-time "$((CURL_TIMEOUT * 2))" \
+    "$url") || die "拉取 ops 探针配置失败"
+
+  [[ "$http_code" =~ ^2 ]] || die "拉取 ops 探针配置 HTTP $http_code: $(head -c 300 "$body")"
+
+  while IFS= read -r item; do
+    [[ -z "$item" ]] && continue
+    item=$(printf '%s' "$item" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    [[ "$item" != \{* ]] && item="{${item}"
+    [[ "$item" != *\} ]] && item="${item}}"
+    printf '%s\n' "$item"
+    count=$((count + 1))
+  done < <(grep -oE '\{"service_id"[^{}]*\}' "$body" 2>/dev/null || true)
+
+  if (( count == 0 )); then
+    die "ops 平台未配置探针目标（请在运维平台「服务健康检查」中配置并保存）"
+  fi
+}
+
 list_probe_target_items() {
   if [[ -n "${PROBE_TARGETS:-}" ]]; then
     split_manual_targets
+  elif [[ "${USE_OPS_PROBE_CONFIG:-0}" == "1" ]]; then
+    fetch_ops_probe_targets
   else
     list_discovered_targets
   fi
@@ -253,6 +302,9 @@ EOF
   done < <(list_probe_target_items)
 
   if (( count == 0 )); then
+    if [[ "${USE_OPS_PROBE_CONFIG:-0}" == "1" ]]; then
+      die "ops 平台未配置探针目标（请在运维平台配置并保存）"
+    fi
     if [[ -n "${PROBE_TARGETS:-}" ]]; then
       die "未配置有效探针目标（检查 PROBE_TARGETS）"
     fi

@@ -2,7 +2,7 @@
 
 整个目录拷到 production 服务器，**推送地址与 Token 已预填，开箱可跑**。
 
-脚本每次运行通过 `ss -tlnH` **自动发现本机所有 TCP 监听端口**并探针（80 用 HTTP、443/8443 用 HTTPS，其余用 TCP）。无需手动列举端口。
+脚本每次运行通过 `ss -tlnH` **自动发现本机所有 TCP 监听端口**并探针（80 用 HTTP，其余含 443/8443 用 TCP）。无需手动列举端口。对 `127.0.0.1:443` 做 HTTPS 会因缺少域名 SNI 易误报，故自动发现默认不做 HTTPS；若要用域名做 HTTPS，请在 `PROBE_TARGETS` 或运维平台探针配置中指定。
 
 ```bash
 cd service-health/production
