@@ -135,6 +135,24 @@ infer_probe_type() {
   esac
 }
 
+normalize_probe_type() {
+  local probe_type=$1 host=$2 port=$3
+  probe_type=${probe_type:-tcp}
+  if [[ "$probe_type" == "https" && ( "$port" == "443" || "$port" == "8443" ) ]]; then
+    case "$host" in
+      127.0.0.1|localhost|::1|[[]::1[]]|0.0.0.0|[[]0:0:0:0:0:0:0:0[]])
+        echo tcp
+        return 0
+        ;;
+      [0-9]*.[0-9]*.[0-9]*.[0-9]*)
+        echo tcp
+        return 0
+        ;;
+    esac
+  fi
+  echo "$probe_type"
+}
+
 list_listening_endpoints() {
   command -v ss >/dev/null 2>&1 || die "需要 ss 命令（iproute2）"
   ss -tlnH 2>/dev/null | awk '
@@ -351,6 +369,7 @@ build_services_json() {
     [[ -z "$name" ]] && name="$service_id"
     [[ -z "$host" ]] && host="127.0.0.1"
     [[ -z "$probe_type" ]] && probe_type="tcp"
+    probe_type=$(normalize_probe_type "$probe_type" "$host" "$port")
 
     case "$probe_type" in
       tcp)

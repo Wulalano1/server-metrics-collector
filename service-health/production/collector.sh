@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # 独立服务端口健康探针（与 ops 完全解耦，自行 cron / systemd 运行）
-# 默认自动采集本机所有 TCP 监听端口（ss -tlnH）；可选 PROBE_TARGETS 手动覆盖、PROBE_EXCLUDE_PORTS 排除端口
+# 探针目标优先级：PROBE_TARGETS > USE_OPS_PROBE_CONFIG（仅 ops 配置）> 自动发现 + PROBE_PORTS + ops 额外配置（合并去重）
+# PROBE_PORTS 示例：9999,8788（可填不在 ss 监听列表中的端口）
 # 用法:
 #   ./collector.sh              # 单次推送（适合 cron）
 #   ./collector.sh --loop       # 持续探针（适合 systemd）
@@ -134,6 +135,24 @@ infer_probe_type() {
   esac
 }
 
+normalize_probe_type() {
+  local probe_type=$1 host=$2 port=$3
+  probe_type=${probe_type:-tcp}
+  if [[ "$probe_type" == "https" && ( "$port" == "443" || "$port" == "8443" ) ]]; then
+    case "$host" in
+      127.0.0.1|localhost|::1|[[]::1[]]|0.0.0.0|[[]0:0:0:0:0:0:0:0[]])
+        echo tcp
+        return 0
+        ;;
+      [0-9]*.[0-9]*.[0-9]*.[0-9]*)
+        echo tcp
+        return 0
+        ;;
+    esac
+  fi
+  echo "$probe_type"
+}
+
 list_listening_endpoints() {
   command -v ss >/dev/null 2>&1 || die "需要 ss 命令（iproute2）"
   ss -tlnH 2>/dev/null | awk '
@@ -183,18 +202,55 @@ list_discovered_targets() {
   done <<< "$sorted_ports"
 }
 
+list_ports_from_env() {
+  local ports_raw=${PROBE_PORTS:?}
+  local default_host=${PROBE_PORT_HOST:-127.0.0.1}
+  declare -A endpoint_host
+  local host port probe_type sorted_ports
+
+  while IFS=$'\t' read -r host port; do
+    [[ -z "$port" ]] && continue
+    if [[ -z "${endpoint_host[$port]:-}" || "$host" == "127.0.0.1" ]]; then
+      endpoint_host[$port]="$host"
+    fi
+  done < <(list_listening_endpoints)
+
+  sorted_ports=$(
+    tr ', ' '\n' <<< "$ports_raw" | sed '/^$/d' | sort -nu
+  )
+
+  while IFS= read -r port; do
+    [[ -z "$port" ]] && continue
+    [[ ! "$port" =~ ^[0-9]+$ ]] && continue
+    port_excluded "$port" && continue
+    host=${endpoint_host[$port]:-$default_host}
+    probe_type=$(infer_probe_type "$port")
+    printf '{"service_id":"port-%s","name":"Port %s","probe_type":"%s","host":"%s","port":%s}\n' \
+      "$port" "$port" "$probe_type" "$host" "$port"
+  done <<< "$sorted_ports"
+}
+
 split_manual_targets() {
   local raw=${PROBE_TARGETS:?}
   raw=$(printf '%s' "$raw" | tr -d '\n\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
   raw=${raw#\[}
   raw=${raw%\]}
 
-  printf '%s' "$raw" | sed 's/[[:space:]]*}[[:space:]]*,[[:space:]]*{[[:space:]]*/}\n{/g' | while IFS= read -r line; do
-    line=$(printf '%s' "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-    [[ -z "$line" ]] && continue
-    [[ "$line" != \{* ]] && line="{${line}"
-    [[ "$line" != *\} ]] && line="${line}}"
-    printf '%s\n' "$line"
+  local rest="$raw" chunk
+  while [[ -n "$rest" ]]; do
+    rest="${rest#"${rest%%[![:space:]]*}"}"
+    if [[ "$rest" == *'},'* ]]; then
+      chunk="${rest%%\},*}"
+      rest="${rest#*\},}"
+    else
+      chunk="$rest"
+      rest=""
+    fi
+    chunk=$(printf '%s' "$chunk" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    [[ -z "$chunk" ]] && continue
+    [[ "$chunk" != \{* ]] && chunk="{${chunk}"
+    [[ "$chunk" != *\} ]] && chunk="${chunk}}"
+    printf '%s\n' "$chunk"
   done
 }
 
@@ -210,9 +266,9 @@ ops_probe_targets_url() {
   return 1
 }
 
-fetch_ops_probe_targets() {
+try_fetch_ops_probe_targets() {
   local url body http_code item count=0
-  url="$(ops_probe_targets_url)" || die "无法解析 OPS 探针配置 URL（设置 OPS_PROBE_TARGETS_URL 或 OPS_PUSH_URL）"
+  url="$(ops_probe_targets_url)" || return 1
   url="${url}?env=${SERVER_ENV}"
 
   body=$(mktemp)
@@ -221,9 +277,9 @@ fetch_ops_probe_targets() {
     -H "Authorization: Bearer $METRICS_PUSH_TOKEN" \
     --connect-timeout "$CURL_TIMEOUT" \
     --max-time "$((CURL_TIMEOUT * 2))" \
-    "$url") || die "拉取 ops 探针配置失败"
+    "$url") || return 1
 
-  [[ "$http_code" =~ ^2 ]] || die "拉取 ops 探针配置 HTTP $http_code: $(head -c 300 "$body")"
+  [[ "$http_code" =~ ^2 ]] || return 1
 
   while IFS= read -r item; do
     [[ -z "$item" ]] && continue
@@ -234,19 +290,64 @@ fetch_ops_probe_targets() {
     count=$((count + 1))
   done < <(grep -oE '\{"service_id"[^{}]*\}' "$body" 2>/dev/null || true)
 
-  if (( count == 0 )); then
-    die "ops 平台未配置探针目标（请在运维平台「服务健康检查」中配置并保存）"
-  fi
+  (( count > 0 ))
+}
+
+fetch_ops_probe_targets() {
+  try_fetch_ops_probe_targets || die "ops 平台未配置探针目标（请在运维平台「服务健康检查」中配置并保存，或设置 PROBE_PORTS）"
+}
+
+merge_probe_target_streams() {
+  declare -A seen_keys
+  local item key service_id host port
+
+  while IFS= read -r item; do
+    [[ -z "$item" ]] && continue
+    item=$(printf '%s' "$item" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    service_id=$(parse_target_field "$item" service_id)
+    host=$(parse_target_field "$item" host)
+    port=$(parse_target_number "$item" port)
+    [[ -z "$port" ]] && continue
+    [[ -z "$host" ]] && host="127.0.0.1"
+    key="${service_id:-${host}:${port}}"
+    [[ -n "${seen_keys[$key]:-}" ]] && continue
+    seen_keys[$key]=1
+    printf '%s\n' "$item"
+  done
+}
+
+emit_probe_ports_from_env() {
+  [[ -z "${PROBE_PORTS:-}" ]] && return 0
+  list_ports_from_env
+}
+
+emit_ops_probe_targets() {
+  try_fetch_ops_probe_targets || true
 }
 
 list_probe_target_items() {
   if [[ -n "${PROBE_TARGETS:-}" ]]; then
     split_manual_targets
-  elif [[ "${USE_OPS_PROBE_CONFIG:-0}" == "1" ]]; then
-    fetch_ops_probe_targets
-  else
-    list_discovered_targets
+    return
   fi
+
+  if [[ "${USE_OPS_PROBE_CONFIG:-0}" == "1" ]]; then
+    if try_fetch_ops_probe_targets; then
+      return 0
+    fi
+    if [[ -n "${PROBE_PORTS:-}" ]]; then
+      list_ports_from_env
+      return 0
+    fi
+    fetch_ops_probe_targets
+    return
+  fi
+
+  {
+    list_discovered_targets
+    emit_probe_ports_from_env
+    emit_ops_probe_targets
+  } | merge_probe_target_streams
 }
 
 build_services_json() {
@@ -268,6 +369,7 @@ build_services_json() {
     [[ -z "$name" ]] && name="$service_id"
     [[ -z "$host" ]] && host="127.0.0.1"
     [[ -z "$probe_type" ]] && probe_type="tcp"
+    probe_type=$(normalize_probe_type "$probe_type" "$host" "$port")
 
     case "$probe_type" in
       tcp)
@@ -303,10 +405,13 @@ EOF
 
   if (( count == 0 )); then
     if [[ "${USE_OPS_PROBE_CONFIG:-0}" == "1" ]]; then
-      die "ops 平台未配置探针目标（请在运维平台配置并保存）"
+      die "ops 平台未配置探针目标（请在运维平台配置并保存，或设置 PROBE_PORTS）"
     fi
     if [[ -n "${PROBE_TARGETS:-}" ]]; then
       die "未配置有效探针目标（检查 PROBE_TARGETS）"
+    fi
+    if [[ -n "${PROBE_PORTS:-}" ]]; then
+      die "PROBE_PORTS 未匹配到有效端口（检查端口列表或 PROBE_EXCLUDE_PORTS）"
     fi
     die "未发现可探针的 TCP 监听端口（检查 ss -tlnH 或 PROBE_EXCLUDE_PORTS）"
   fi
