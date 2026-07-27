@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # 独立服务端口健康探针（与 ops 完全解耦，自行 cron / systemd 运行）
-# 探针目标优先级：PROBE_TARGETS > USE_OPS_PROBE_CONFIG（仅 ops 配置）> 自动发现 + PROBE_PORTS + ops 额外配置（合并去重）
+# 探针目标优先级：PROBE_TARGETS > USE_OPS_PROBE_CONFIG（仅 ops 配置）> 自动发现 + PROBE_PORTS + ops 额外配置（按 host:port 合并，ops 覆盖同端点；不同 host 的 80 端口可并存）
 # PROBE_PORTS 示例：9999,8788（可填不在 ss 监听列表中的端口）
 # 用法:
 #   ./collector.sh              # 单次推送（适合 cron）
@@ -298,21 +298,74 @@ fetch_ops_probe_targets() {
   try_fetch_ops_probe_targets || die "ops 平台未配置探针目标（请在运维平台「服务健康检查」中配置并保存，或设置 PROBE_PORTS）"
 }
 
+set_target_field() {
+  local json=$1 field=$2 value=$3
+  local escaped
+  escaped=$(json_escape "$value")
+  if printf '%s' "$json" | grep -qE "\"${field}\""; then
+    printf '%s' "$json" | sed -E "s/\"${field}\"[[:space:]]*:[[:space:]]*\"[^\"]*\"/\"${field}\":\"${escaped}\"/g"
+  else
+    printf '%s' "$json"
+  fi
+}
+
+# 合并多路探针目标：同一 host:port 后出现的条目覆盖先前的（ops 可覆盖自动发现的本机同端口）。
+# 不同 host 的相同端口号（如 127.0.0.1:80 与 47.243.177.253:80）会全部保留。
 merge_probe_target_streams() {
-  declare -A seen_keys
-  local item key service_id host port
+  declare -A merged_items
+  local item key host port
 
   while IFS= read -r item; do
     [[ -z "$item" ]] && continue
     item=$(printf '%s' "$item" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-    service_id=$(parse_target_field "$item" service_id)
     host=$(parse_target_field "$item" host)
     port=$(parse_target_number "$item" port)
     [[ -z "$port" ]] && continue
     [[ -z "$host" ]] && host="127.0.0.1"
-    key="${service_id:-${host}:${port}}"
-    [[ -n "${seen_keys[$key]:-}" ]] && continue
-    seen_keys[$key]=1
+    key="${host}:${port}"
+    merged_items[$key]="$item"
+  done
+
+  local key
+  for key in $(printf '%s\n' "${!merged_items[@]}" | sort); do
+    printf '%s\n' "${merged_items[$key]}"
+  done
+}
+
+# 多条目标若共用 service_id 但 host:port 不同，为后续条目追加 -<host> 后缀，避免入库时互相覆盖。
+ensure_unique_service_ids() {
+  declare -A id_to_endpoint
+  local item service_id host port endpoint new_id host_slug suffix counter
+
+  while IFS= read -r item; do
+    [[ -z "$item" ]] && continue
+    item=$(printf '%s' "$item" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+
+    service_id=$(parse_target_field "$item" service_id)
+    host=$(parse_target_field "$item" host)
+    port=$(parse_target_number "$item" port)
+    [[ -z "$service_id" || -z "$port" ]] && continue
+    [[ -z "$host" ]] && host="127.0.0.1"
+    endpoint="${host}:${port}"
+
+    if [[ -n "${id_to_endpoint[$service_id]:-}" && "${id_to_endpoint[$service_id]}" != "$endpoint" ]]; then
+      host_slug=$(printf '%s' "$host" | tr '.:' '-')
+      suffix="-${host_slug}"
+      new_id="${service_id}${suffix}"
+      if ((${#new_id} > 48)); then
+        new_id="${service_id:0:$((48 - ${#suffix}))}${suffix}"
+      fi
+      counter=2
+      while [[ -n "${id_to_endpoint[$new_id]:-}" && "${id_to_endpoint[$new_id]}" != "$endpoint" ]]; do
+        suffix="-${host_slug}-${counter}"
+        new_id="${service_id:0:$((48 - ${#suffix}))}${suffix}"
+        counter=$((counter + 1))
+      done
+      item=$(set_target_field "$item" service_id "$new_id")
+      service_id="$new_id"
+    fi
+
+    id_to_endpoint[$service_id]="$endpoint"
     printf '%s\n' "$item"
   done
 }
@@ -348,7 +401,7 @@ list_probe_target_items() {
     list_discovered_targets
     emit_probe_ports_from_env
     emit_ops_probe_targets
-  } | merge_probe_target_streams
+  } | merge_probe_target_streams | ensure_unique_service_ids
 }
 
 build_services_json() {
